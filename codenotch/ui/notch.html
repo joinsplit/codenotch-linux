@@ -43,6 +43,11 @@
     font-size:20px;font-weight:700;color:#e8e8ea;letter-spacing:-.5px;
   }
   .glyph.small{font-size:15px}
+  /* Two bands: the glyph shrinks so the innermost (working) arc keeps a gap around it */
+  .cell.two .glyph{font-size:16px}
+  .cell.two .glyph.small{font-size:12px}
+  .cell.two .glyph .mark,.cell.two .glyph .mark svg,.cell.two .glyph img.png{width:20px;height:20px}
+  .cell.two .glyph img.appicon{width:22px;height:22px;border-radius:6px}
   /* Glyphs: mark = the provider's own brand mark (monochrome, shown white); appicon = the installed app's icon (colour, rounded and shrunk) */
   .glyph img,.glyph svg{display:block;pointer-events:none;user-select:none}
   .glyph .mark{display:block;width:26px;height:26px;color:#e8e8ea}
@@ -159,6 +164,18 @@ function headlineOf(snap){
   if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
   return snap.windows[0];
 }
+/* Two rings when a provider publishes both a short window (session / 5 h) and a long one (weekly / monthly):
+   outer = the most constrained long window, inner = the most constrained short window. One ring otherwise. */
+const isLong=w=>/week|seven_day|month|secondary/i.test(w.id+' '+w.label);
+const isShort=w=>!isLong(w)&&/session|five_hour|primary|hour/i.test(w.id+' '+w.label);
+function ringsOf(snap){
+  const m=snap.windows.filter(w=>w.count==null);
+  if(!m.length) return {outer:null,inner:null};
+  const most=a=>a.reduce((x,y)=>y.used>x.used?y:x);
+  const long=m.filter(isLong), short=m.filter(isShort);
+  if(long.length&&short.length) return {outer:most(long),inner:most(short)};
+  return {outer:most(m),inner:null};
+}
 function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
 let stateSnap={sessions:[],agg:'idle'};
 
@@ -184,12 +201,18 @@ function renderRing(){
     const cell=pill.querySelector(`.cell[data-p="${p.id}"]`); if(!cell) continue;
     const svg=cell.querySelector('svg.ring'), pct=cell.querySelector('.pct'), glyph=cell.querySelector('.glyph'), wrap=cell.querySelector('.ringwrap');
     const h=headlineOf(p.snap);
+    const rings=ringsOf(p.snap);
     let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
-    if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
-    { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
-      const ws=workState(p.id);
-      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
-      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
+    if(rings.outer) inner+=svgArc(25,Math.min(rings.outer.used,1),tone(rings.outer.used),5);
+    if(rings.inner){ // second band: the session window on its own track
+      inner+=`<circle cx="28" cy="28" r="19.5" fill="none" stroke="#3a3a3a" stroke-width="3.5"/>`;
+      inner+=svgArc(19.5,Math.min(rings.inner.used,1),tone(rings.inner.used),3.5);
+    }
+    cell.classList.toggle('two',!!rings.inner);
+    { // thin innermost arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources); moves inward when two bands are drawn
+      const ws=workState(p.id), r=rings.inner?14.5:19, w=rings.inner?2:2.5;
+      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(r,0.28,RUNGREEN,w)}</g>`;
+      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="${r}" fill="none" stroke="${AMBER}" stroke-width="${w}"/></g>`;
     }
     svg.innerHTML=inner;
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
@@ -228,6 +251,7 @@ function renderCard(){
   let html=`<div class="c-head">${headIcon}<span class="c-title">${esc(p.name)} Usage</span></div>`;
   if(p.tag&&p.dir) html+=`<div class="c-sub">${esc(p.dir)}</div>`;
   if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">Updated ${ago(snap.fetched_at)}</div>`;
+  { const r=ringsOf(snap); if(r.inner) html+=`<div class="c-sub">Outer ring: ${esc(r.outer.label)} · inner ring: ${esc(r.inner.label)}</div>`; }
   if(snap.status==='needsAuth'){
     const who=p.id.startsWith('claude')
       ? (p.tag ? `Sign in to Claude Code with CLAUDE_CONFIG_DIR=${esc(p.dir)} to see usage.` : 'Sign in to Claude Code to see usage.')
