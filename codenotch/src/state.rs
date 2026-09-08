@@ -43,6 +43,9 @@ pub struct Session {
     pub last_event: u64,
     #[serde(skip)]
     pub cwd: String,
+    /// Claude profile id the session belongs to (`claude`, `claude-work`, …), from the transcript path
+    #[serde(default)]
+    pub profile: String,
     /// Time of the last real hook event; watcher inference is ignored while hook data is fresh
     #[serde(skip)]
     pub last_hook: u64,
@@ -55,6 +58,8 @@ const HOOK_FRESH_MS: u64 = 5 * 60 * 1000;
 pub struct Snapshot {
     pub sessions: Vec<Session>,
     pub agg: String,
+    /// The same aggregate per Claude profile id, so each ring spins for its own sessions only
+    pub agg_by_profile: HashMap<String, String>,
     pub counts: HashMap<String, usize>,
     /// The language the user chose (may be "auto"; used to highlight the menu item)
     pub lang: String,
@@ -79,6 +84,8 @@ pub struct HookEvent {
     pub tool_name: String,
     pub tool_cmd: String,
     pub model: String,
+    /// Claude profile id (empty = unknown, keeps whatever the session already has)
+    pub profile: String,
     /// "hook" (a real event) or "watch" (transcript inference, the desktop app's fallback)
     pub src: &'static str,
 }
@@ -124,8 +131,12 @@ impl Store {
                 ppid: 0,
                 last_event: now,
                 cwd: ev.cwd.clone(),
+                profile: if ev.profile.is_empty() { crate::profiles::DEFAULT_ID.into() } else { ev.profile.clone() },
                 last_hook: 0,
             });
+        if !ev.profile.is_empty() && s.profile != ev.profile {
+            s.profile = ev.profile.clone();
+        }
         // Source arbitration: a session with fresh hook data does not accept watcher inference
         if ev.src == "watch" && s.last_hook > 0 && now.saturating_sub(s.last_hook) < HOOK_FRESH_MS {
             return false;
@@ -268,9 +279,17 @@ impl Store {
             .find(|k| counts.get(**k).copied().unwrap_or(0) > 0)
             .map(|k| k.to_string())
             .unwrap_or_else(|| ST_IDLE.to_string());
+        let mut agg_by_profile: HashMap<String, String> = HashMap::new();
+        for s in &sessions {
+            let cur = agg_by_profile.entry(s.profile.clone()).or_insert_with(|| ST_IDLE.to_string());
+            if rank(&s.state) < rank(cur) {
+                *cur = s.state.clone();
+            }
+        }
         Snapshot {
             sessions,
             agg,
+            agg_by_profile,
             counts,
             lang: lang.to_string(),
             lang_resolved: lang_resolved.to_string(),

@@ -61,6 +61,8 @@ struct Trk {
     interrupted: bool,
     prompt: String,
     model: String,
+    /// Claude profile id, from the transcript's path
+    profile: String,
 }
 
 fn now_ms() -> u64 {
@@ -70,12 +72,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Watch roots: the CLI's ~/.claude/projects plus the desktop app's (Cowork) session mirrors
-/// (each desktop session has its own .claude/projects under %APPDATA%\Claude\local-agent-mode-sessions)
+/// Watch roots: every Claude profile's projects folder (~/.claude/projects, ~/.claude-<slug>/projects) plus the
+/// desktop app's (Cowork) session mirrors (each desktop session has its own .claude/projects under
+/// %APPDATA%\Claude\local-agent-mode-sessions)
 pub fn roots() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Some(h) = dirs::home_dir() {
-        v.push(h.join(".claude").join("projects"));
+    for p in crate::profiles::discover() {
+        v.push(p.dir.join("projects"));
     }
     if let Some(c) = dirs::config_dir() {
         v.push(c.join("Claude").join("local-agent-mode-sessions"));
@@ -116,7 +119,7 @@ pub fn is_session_jsonl(p: &Path) -> bool {
         if s == "subagents" {
             return false;
         }
-        if s == ".claude" {
+        if s == ".claude" || (s.starts_with(".claude-") && s.len() > 8) {
             in_claude = true;
         }
     }
@@ -369,6 +372,7 @@ fn ingest(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>, path: &Path) {
         interrupted: false,
         prompt: String::new(),
         model: String::new(),
+        profile: crate::profiles::id_for_path(path),
     });
     t.session = session;
     if !cwd.is_empty() {
@@ -488,6 +492,7 @@ fn push(app: &AppHandle, e: &str, t: &Trk) {
         tool_name: String::new(),
         tool_cmd: String::new(),
         model: t.model.clone(),
+        profile: t.profile.clone(),
         src: "watch",
     };
     let changed = {

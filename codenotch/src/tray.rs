@@ -89,8 +89,10 @@ fn handle(app: &AppHandle, id: &str) {
         "refresh" => {
             {
                 let st = app.state::<crate::AppState>();
-                let mut u = st.usage.lock().unwrap();
-                u.backoff_until = 0;
+                let mut all = st.usage.lock().unwrap();
+                for u in all.values_mut() {
+                    u.backoff_until = 0;
+                }
             }
             crate::usage::request_refresh();
             crate::codex::request_refresh();

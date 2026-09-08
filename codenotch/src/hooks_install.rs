@@ -15,8 +15,9 @@ const WIRING: &[(&str, bool, &str)] = &[
     ("SessionEnd", false, "session_end"),
 ];
 
-fn settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+/// One settings.json per Claude profile (~/.claude, ~/.claude-work, …): a hook installed in one alone would leave the other profile's sessions invisible
+fn settings_paths() -> Vec<PathBuf> {
+    crate::profiles::discover().into_iter().map(|p| p.dir.join("settings.json")).collect()
 }
 
 fn is_ours(entry: &Value) -> bool {
@@ -55,15 +56,28 @@ fn backup_and_write(path: &PathBuf, root: &Value) -> Result<(), String> {
     std::fs::write(path, txt).map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 pub fn is_installed() -> bool {
-    settings_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| t.contains("codenotch-hook"))
-        .unwrap_or(false)
+    settings_paths()
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .any(|t| t.contains("codenotch-hook"))
 }
 
 pub fn install() -> Result<String, String> {
-    let path = settings_path().ok_or("cannot find the user directory")?;
+    let paths = settings_paths();
+    if paths.is_empty() {
+        return Err("cannot find the user directory".into());
+    }
+    let mut done = Vec::new();
+    for path in &paths {
+        install_into(path)?;
+        done.push(path.display().to_string());
+    }
+    Ok(format!("wrote {} ({} events each)", done.join(", "), WIRING.len()))
+}
+
+fn install_into(path: &PathBuf) -> Result<(), String> {
     let hook_exe = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
@@ -73,7 +87,7 @@ pub fn install() -> Result<String, String> {
         return Err(format!("missing {}", hook_exe.display()));
     }
 
-    let mut root = load(&path);
+    let mut root = load(path);
     if !root.is_object() {
         root = json!({});
     }
@@ -96,18 +110,29 @@ pub fn install() -> Result<String, String> {
         root["hooks"][*event] = json!(arr);
     }
 
-    backup_and_write(&path, &root)?;
-    Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
+    backup_and_write(path, &root)
 }
 
 pub fn uninstall() -> Result<String, String> {
-    let path = settings_path().ok_or("cannot find the user directory")?;
-    if !path.exists() {
+    let mut removed = 0;
+    let mut touched = 0;
+    for path in settings_paths() {
+        if !path.exists() {
+            continue;
+        }
+        removed += uninstall_from(&path)?;
+        touched += 1;
+    }
+    if touched == 0 {
         return Ok("settings.json does not exist, nothing to uninstall".into());
     }
-    let mut root = load(&path);
+    Ok(format!("removed {removed} Codenotch hook(s) from {touched} settings file(s)"))
+}
+
+fn uninstall_from(path: &PathBuf) -> Result<usize, String> {
+    let mut root = load(path);
     let Some(hooks) = root["hooks"].as_object_mut() else {
-        return Ok("no hooks configuration found".into());
+        return Ok(0);
     };
     let mut removed = 0;
     for (_, v) in hooks.iter_mut() {
@@ -117,6 +142,8 @@ pub fn uninstall() -> Result<String, String> {
             *v = json!(filtered);
         }
     }
-    backup_and_write(&path, &root)?;
-    Ok(format!("removed {removed} Codenotch hook(s)"))
+    if removed > 0 {
+        backup_and_write(path, &root)?;
+    }
+    Ok(removed)
 }

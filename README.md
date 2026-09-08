@@ -22,6 +22,18 @@ GNOME, Wayland session (see [Wayland](#wayland) below).
 
 Providers that are not installed simply do not get a cell.
 
+### Claude profiles (work and personal)
+
+Claude Code keeps everything for one account under a single directory: `~/.claude` by default, or
+wherever `CLAUDE_CONFIG_DIR` points. If you keep a second login apart as `~/.claude-work`
+(or `~/.claude-client`, and so on), each such directory is a **profile** and gets its own ring:
+`~/.claude` first, then every used `~/.claude-<slug>` in alphabetical order, with the slug shown as
+a small tag under the ring. Each ring polls its own credential, watches its own `projects` folder
+and spins only for its own sessions; the card names the directory and lists that profile's sessions.
+`install-hooks` wires the hook into every profile's `settings.json`. A profile that Claude Code has
+never run against (no credential, settings or projects yet) is ignored, so a stray directory never
+shows a permanent "sign in" ring. New profiles are picked up on the next usage poll; no restart needed.
+
 ## Install / build
 
 Prerequisites: Rust (`rustup`), and the Tauri 2 Linux libraries:

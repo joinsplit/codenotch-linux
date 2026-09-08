@@ -52,6 +52,7 @@
   .c-head .mark{display:inline-block;width:16px;height:16px;color:#e8e8ea;margin-right:2px}
   .c-head .mark svg{width:16px;height:16px;fill:currentColor}
   .pct{font-size:15px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums}
+  .tag{font-size:9px;font-weight:600;color:#9a9a9e;letter-spacing:.4px;text-transform:uppercase;line-height:1;margin:-2px 0 -3px} /* profile slug (work, client…) under a Claude ring */
   .dim{opacity:.55}
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -113,7 +114,7 @@ const AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
 const TRACK='#303030', AMBER='#FFBF00', RUNGREEN='#28E07B';
 const tone=f=> f>=0.8?CRIT : f>=0.5?WATCH : AMPLE;
 
-let usage={status:'',windows:[],fetched_at:0,note:''};
+let claude=[]; // one entry per Claude profile, in display order: {id:'claude'|'claude-<slug>', name, dir, snap}
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -121,11 +122,12 @@ let glyphs={}; // id → {kind:'mark'|'appicon', url}
 let activity=[]; // working state of the non-Claude providers: {provider,state:'busy'|'waiting',name,detail,since}
 // "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
 function workState(id){
-  if(id==='claude'){
-    if(stateSnap.agg==='running') return 'running';
-    if(stateSnap.agg==='attention') return 'attention';
-    // The engine cannot see cloud sessions: fall back to the desktop app's network activity
-    if(activity.some(a=>a.provider==='claude'&&a.state==='busy')) return 'running';
+  if(id.startsWith('claude')){ // each profile's ring answers for its own sessions only
+    const agg=(stateSnap.agg_by_profile&&stateSnap.agg_by_profile[id])||'idle';
+    if(agg==='running') return 'running';
+    if(agg==='attention') return 'attention';
+    // The engine cannot see cloud sessions: fall back to the desktop app's network activity (default profile)
+    if(id==='claude'&&activity.some(a=>a.provider==='claude'&&a.state==='busy')) return 'running';
     return 'idle';
   }
   const acts=activity.filter(a=>a.provider===id);
@@ -133,15 +135,19 @@ function workState(id){
   if(acts.some(a=>a.state==='busy')) return 'running';
   return 'idle';
 }
+function glyphOf(id){ return glyphs[id]||(id.startsWith('claude-')?glyphs.claude:null); } // every Claude profile draws the Claude mark
 function glyphHtml(p,small){
-  const g=glyphs[p.id];
+  const g=glyphOf(p.id);
   if(g&&g.kind==='svg'&&g.svg) return `<span class="mark">${g.svg}</span>`;
   if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${p.name}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
   return small?'':p.glyph; // fallback letter
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 function providers(){
-  const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
+  // Claude first: one cell per profile (~/.claude, then ~/.claude-<slug> alphabetically); the slug is the tag under the ring
+  const list=claude.length
+    ? claude.map(c=>({id:c.id,name:c.name,dir:c.dir,glyph:'C',snap:c.snap,tag:c.id.startsWith('claude-')?c.id.slice(7):''}))
+    : [{id:'claude',name:'Claude',dir:'',glyph:'C',snap:{status:'',windows:[],fetched_at:0,note:''},tag:''}];
   if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
@@ -163,25 +169,16 @@ function svgArc(r,frac,color,width,extra=''){
     transform="rotate(-90 28 28)" ${extra}/>`;
 }
 
-function headline(){ // the cell shows the most constrained window — the one that will stop you first
-  if(!usage.windows.length) return null;
-  return usage.windows.reduce((a,b)=> b.used>a.used?b:a);
-}
-
-function isStale(){
-  if(usage.status==='stale') return true;
-  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
-}
-
 function renderRing(){
   const ps=providers();
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
-  const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
+  const want=ps.map(p=>p.id+':'+(glyphOf(p.id)?glyphOf(p.id).kind:'-')).join(',');
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
-      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
-      <div class="pct">—</div></div>`).join('');
+      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphOf(p.id)&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
+      ${p.tag?`<div class="tag">${esc(p.tag)}</div>`:''}<div class="pct">—</div></div>`).join('');
     pill.dataset.cells=want;
+    jslog('cells: '+want); // which cells the pill holds (one per Claude profile, then the other providers)
   }
   for(const p of ps){
     const cell=pill.querySelector(`.cell[data-p="${p.id}"]`); if(!cell) continue;
@@ -228,10 +225,13 @@ function renderCard(){
   const p=providers().find(x=>x.id===hoverId)||providers()[0];
   const snap=p.snap;
   const headIcon=glyphHtml(p,true);
-  let html=`<div class="c-head">${headIcon}<span class="c-title">${p.name} Usage</span></div>`;
+  let html=`<div class="c-head">${headIcon}<span class="c-title">${esc(p.name)} Usage</span></div>`;
+  if(p.tag&&p.dir) html+=`<div class="c-sub">${esc(p.dir)}</div>`;
   if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">Updated ${ago(snap.fetched_at)}</div>`;
   if(snap.status==='needsAuth'){
-    const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.'}[p.id]||'';
+    const who=p.id.startsWith('claude')
+      ? (p.tag ? `Sign in to Claude Code with CLAUDE_CONFIG_DIR=${esc(p.dir)} to see usage.` : 'Sign in to Claude Code to see usage.')
+      : ({cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.'}[p.id]||'');
     html+=`<div class="c-note">${who}<br>${snap.note||''}</div>`;
   }else if(!snap.windows.length){
     html+=`<div class="c-note">${snap.note||'Waiting for first reading…'}</div>`;
@@ -250,8 +250,8 @@ function renderCard(){
     }
     if(snap.note) html+=`<div class="c-note">${snap.note}</div>`;
   }
-  if(p.id==='claude'){ // live sessions (a full list with jump-to-session is a follow-up)
-    const act=stateSnap.sessions.filter(s=>s.state!=='idle');
+  if(p.id.startsWith('claude')){ // live sessions of this profile (a full list with jump-to-session is a follow-up)
+    const act=stateSnap.sessions.filter(s=>s.state!=='idle'&&((s.profile||'claude')===p.id));
     if(act.length){
       html+=`<div class="c-sessions">`;
       for(const s of act.slice(0,5)){
@@ -294,6 +294,7 @@ function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:fals
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
+window.addEventListener('error',e=>jslog(`error: ${e.message} @${e.lineno}:${e.colno}`)); // uncaught page errors land in run.log
 function callq(cmd,args){ // invoke with visible failure: any command error is reported on screen (a silent .catch used to swallow them)
   return invoke(cmd,args).catch(e=>{notice(cmd+' failed: '+(e&&e.message||e));throw e;});
 }
@@ -381,7 +382,7 @@ function notice(msg){
   clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
 }
 
-listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})
+listen('usage',e=>{claude=e.payload||claude;renderRing();if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(usage) failed: '+e));
 listen('state',e=>{stateSnap=e.payload||stateSnap;renderRing();if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(state) failed: '+e));
@@ -396,7 +397,7 @@ listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classLis
 invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});
 invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
-invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
+invoke('get_usage').then(u=>{claude=u||claude;renderRing();}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;renderRing();}).catch(()=>{});
 setInterval(renderRing,30_000); // stale state and reset copy move with time
 </script>

@@ -2,15 +2,19 @@
 //! Endpoint: GET https://api.anthropic.com/api/oauth/usage
 //! Headers: Authorization: Bearer <token>; anthropic-beta: oauth-2025-04-20; 15 s timeout
 //! Rules (upstream's discipline):
-//!   - the credential comes from Claude Code's own store (Windows: ~/.claude/.credentials.json), read only
+//!   - the credential comes from Claude Code's own store (<profile dir>/.credentials.json), read only
+//!   - one reading per Claude profile (~/.claude plus every used ~/.claude-<slug>, see profiles.rs), each with its own back-off
 //!   - 401/403 → re-read the credential once and retry (Claude Code may have just refreshed the token) → still failing means needsAuth
 //!   - 429 → back off 60 s × 2^n capped at 15 min, Retry-After only raises it; the deadline is persisted
 //!   - never invent a percentage on failure: keep the last reading marked stale, and the UI shows how old it is
 //! Reply (snake_case): { limits:[{kind,percent,resets_at}], five_hour:{utilization,resets_at}, seven_day:{...} }
 //! limits is the forward-compatible main shape; five_hour/seven_day are merged in as a fallback (a window that just rolled over disappears from limits).
 
+use crate::profiles::{self, Profile};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -35,6 +39,30 @@ fn sleep_interruptible(total_secs: u64) {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// What the page receives: every profile with its reading, in display order
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileUsage {
+    pub id: String,
+    pub name: String,
+    pub dir: String,
+    pub snap: UsageSnapshot,
+}
+
+pub fn profile_usages(app: &AppHandle) -> Vec<ProfileUsage> {
+    let st = app.state::<AppState>();
+    let profiles = st.profiles.lock().unwrap().clone();
+    let usage = st.usage.lock().unwrap();
+    profiles
+        .iter()
+        .map(|p| ProfileUsage {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            dir: p.display_dir(),
+            snap: usage.get(&p.id).cloned().unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn now_ms() -> u64 {
@@ -71,12 +99,17 @@ pub struct UsageSnapshot {
     pub backoff_until: u64,
 }
 
-fn store_path() -> std::path::PathBuf {
-    crate::config::config_path().with_file_name("usage.json")
+/// usage.json for the default profile (unchanged from before profiles existed), usage-<slug>.json for the others
+fn store_path(id: &str) -> std::path::PathBuf {
+    let name = match id.strip_prefix(&format!("{}-", profiles::DEFAULT_ID)) {
+        Some(slug) => format!("usage-{slug}.json"),
+        None => "usage.json".into(),
+    };
+    crate::config::config_path().with_file_name(name)
 }
 
-pub fn load_persisted() -> UsageSnapshot {
-    std::fs::read_to_string(store_path())
+fn load_one(id: &str) -> UsageSnapshot {
+    std::fs::read_to_string(store_path(id))
         .ok()
         .and_then(|t| serde_json::from_str::<UsageSnapshot>(&t).ok())
         .map(|mut s| {
@@ -88,17 +121,20 @@ pub fn load_persisted() -> UsageSnapshot {
         .unwrap_or_default()
 }
 
-fn persist(s: &UsageSnapshot) {
+pub fn load_persisted(profiles: &[Profile]) -> HashMap<String, UsageSnapshot> {
+    profiles.iter().map(|p| (p.id.clone(), load_one(&p.id))).collect()
+}
+
+fn persist(id: &str, s: &UsageSnapshot) {
     if let Ok(t) = serde_json::to_string_pretty(s) {
-        let _ = std::fs::write(store_path(), t);
+        let _ = std::fs::write(store_path(id), t);
     }
 }
 
-/// Reads Claude Code's OAuth credential. Returns (token, expired hint).
-fn read_credentials() -> Option<(String, bool)> {
-    let home = dirs::home_dir()?;
+/// Reads Claude Code's OAuth credential for one profile directory. Returns (token, expired hint).
+fn read_credentials(dir: &Path) -> Option<(String, bool)> {
     for name in [".credentials.json", "credentials.json"] {
-        let p = home.join(".claude").join(name);
+        let p = dir.join(name);
         let Ok(text) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -118,16 +154,26 @@ fn read_credentials() -> Option<(String, bool)> {
     None
 }
 
-/// For doctor: credential probe report (prints no secret values)
+/// For doctor: one credential probe line per profile (prints no secret values)
 pub fn probe_credentials() -> String {
-    match read_credentials() {
-        Some((tok, expired)) => format!(
-            "credential: found (token {} chars, {})",
-            tok.len(),
-            if expired { "expired — Claude Code refreshes it on its next use" } else { "valid" }
-        ),
-        None => "credential: ~/.claude/.credentials.json not found (needsAuth; the desktop app may use another store — signing in once with the Claude Code CLI creates it)".into(),
-    }
+    profiles::discover()
+        .iter()
+        .map(|p| match read_credentials(&p.dir) {
+            Some((tok, expired)) => format!(
+                "credential {} ({}): found (token {} chars, {})",
+                p.name,
+                p.display_dir(),
+                tok.len(),
+                if expired { "expired — Claude Code refreshes it on its next use" } else { "valid" }
+            ),
+            None => format!(
+                "credential {} ({}): .credentials.json not found (needsAuth; signing in once with the Claude Code CLI against that directory creates it)",
+                p.name,
+                p.display_dir()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ")
 }
 
 fn parse_reset(v: &serde_json::Value) -> Option<u64> {
@@ -245,106 +291,145 @@ fn backoff_secs(consecutive: u32, retry_after_floor: u64) -> u64 {
     exp.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS).max(retry_after_floor)
 }
 
-fn set_and_broadcast(app: &AppHandle, mutate: impl FnOnce(&mut UsageSnapshot)) {
-    let st = app.state::<AppState>();
+fn set_and_broadcast(app: &AppHandle, id: &str, mutate: impl FnOnce(&mut UsageSnapshot)) {
     let snap = {
-        let mut u = st.usage.lock().unwrap();
-        mutate(&mut u);
+        let st = app.state::<AppState>();
+        let mut all = st.usage.lock().unwrap();
+        let u = all.entry(id.to_string()).or_default();
+        mutate(u);
         u.clone()
     };
-    persist(&snap);
-    let _ = app.emit("usage", &snap);
+    persist(id, &snap);
+    broadcast(app);
+}
+
+/// The page always gets the whole list, so a new profile or a changed order needs no special event
+pub fn broadcast(app: &AppHandle) {
+    let _ = app.emit("usage", profile_usages(app));
+}
+
+/// Profiles appear when Claude Code is first run against a new directory: pick them up on every cycle (a read_dir of $HOME)
+fn refresh_profiles(app: &AppHandle) -> Vec<Profile> {
+    let found = profiles::discover();
+    let st = app.state::<AppState>();
+    let mut cur = st.profiles.lock().unwrap();
+    if *cur != found {
+        crate::applog(&format!("claude profiles: {}", found.iter().map(|p| p.display_dir()).collect::<Vec<_>>().join(", ")));
+        let mut usage = st.usage.lock().unwrap();
+        for p in &found {
+            usage.entry(p.id.clone()).or_insert_with(|| load_one(&p.id));
+        }
+        *cur = found.clone();
+    }
+    found
+}
+
+/// One poll of one profile; returns the number of consecutive 429s to carry forward
+fn poll_profile(app: &AppHandle, p: &Profile, consecutive_429: u32) -> u32 {
+    let id = p.id.as_str();
+    match read_credentials(&p.dir) {
+        None => {
+            set_and_broadcast(app, id, |u| {
+                u.status = "needsAuth".into();
+                u.note = format!("No Claude Code credential in {}", p.display_dir());
+            });
+            consecutive_429
+        }
+        Some((token, expired)) => {
+            // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
+            let result = match fetch_once(&token) {
+                Err(FetchErr::NeedsAuth) => match read_credentials(&p.dir) {
+                    Some((t2, _)) if t2 != token => fetch_once(&t2),
+                    _ => Err(FetchErr::NeedsAuth),
+                },
+                other => other,
+            };
+            let auth_note = if expired {
+                "Credential expired — run any claude command (or chat with Claude) to refresh it"
+            } else {
+                "Credential rejected (switched accounts?)"
+            };
+            match result {
+                Ok(windows) => {
+                    set_and_broadcast(app, id, |u| {
+                        u.status = "ok".into();
+                        u.windows = windows;
+                        u.fetched_at = now_ms();
+                        u.note.clear();
+                        u.backoff_until = 0;
+                    });
+                    0
+                }
+                Err(FetchErr::NeedsAuth) => {
+                    set_and_broadcast(app, id, |u| {
+                        u.status = "needsAuth".into();
+                        u.note = auth_note.into();
+                    });
+                    consecutive_429
+                }
+                Err(FetchErr::RateLimited(ra)) => {
+                    let wait = backoff_secs(consecutive_429, ra);
+                    set_and_broadcast(app, id, |u| {
+                        if !u.windows.is_empty() {
+                            u.status = "stale".into();
+                        }
+                        u.note = format!("Rate limited, retrying in {wait}s");
+                        u.backoff_until = now_ms() + wait * 1000;
+                    });
+                    consecutive_429 + 1
+                }
+                Err(FetchErr::Other(msg)) => {
+                    set_and_broadcast(app, id, |u| {
+                        if u.windows.is_empty() {
+                            u.status = "error".into();
+                        } else {
+                            u.status = "stale".into();
+                        }
+                        u.note = msg;
+                    });
+                    consecutive_429
+                }
+            }
+        }
+    }
 }
 
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        // Broadcast the persisted old reading at startup (stale beats blank)
-        {
-            let st = app.state::<AppState>();
-            let snap = st.usage.lock().unwrap().clone();
-            let _ = app.emit("usage", &snap);
-        }
-        let mut consecutive_429: u32 = 0;
+        // Broadcast the persisted old readings at startup (stale beats blank)
+        broadcast(&app);
+        let mut consecutive_429: HashMap<String, u32> = HashMap::new();
         loop {
-            // No requests inside the backoff window
-            let bu = {
-                let st = app.state::<AppState>();
-                let u = st.usage.lock().unwrap();
-                u.backoff_until
-            };
+            let profiles = refresh_profiles(&app);
             let now = now_ms();
-            if bu > now {
-                sleep_interruptible(((bu - now) / 1000).clamp(1, 30));
-                continue;
-            }
-            match read_credentials() {
-                None => set_and_broadcast(&app, |u| {
-                    u.status = "needsAuth".into();
-                    u.note = "No Claude Code credential found".into();
-                }),
-                Some((token, expired)) => {
-                    // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
-                    let result = match fetch_once(&token) {
-                        Err(FetchErr::NeedsAuth) => match read_credentials() {
-                            Some((t2, _)) if t2 != token => fetch_once(&t2),
-                            _ => Err(FetchErr::NeedsAuth),
-                        },
-                        other => other,
-                    };
-                    let auth_note = if expired {
-                        "Credential expired — run any claude command (or chat with Claude) to refresh it"
-                    } else {
-                        "Credential rejected (switched accounts?)"
-                    };
-                    match result {
-                        Ok(windows) => {
-                            consecutive_429 = 0;
-                            set_and_broadcast(&app, |u| {
-                                u.status = "ok".into();
-                                u.windows = windows;
-                                u.fetched_at = now_ms();
-                                u.note.clear();
-                                u.backoff_until = 0;
-                            });
-                        }
-                        Err(FetchErr::NeedsAuth) => set_and_broadcast(&app, |u| {
-                            u.status = "needsAuth".into();
-                            u.note = auth_note.into();
-                        }),
-                        Err(FetchErr::RateLimited(ra)) => {
-                            consecutive_429 += 1;
-                            let wait = backoff_secs(consecutive_429 - 1, ra);
-                            set_and_broadcast(&app, |u| {
-                                if !u.windows.is_empty() {
-                                    u.status = "stale".into();
-                                }
-                                u.note = format!("Rate limited, retrying in {wait}s");
-                                u.backoff_until = now_ms() + wait * 1000;
-                            });
-                        }
-                        Err(FetchErr::Other(msg)) => set_and_broadcast(&app, |u| {
-                            if u.windows.is_empty() {
-                                u.status = "error".into();
-                            } else {
-                                u.status = "stale".into();
-                            }
-                            u.note = msg;
-                        }),
-                    }
+            let mut earliest_retry: Option<u64> = None;
+            for p in &profiles {
+                // No requests inside a profile's backoff window
+                let bu = {
+                    let st = app.state::<AppState>();
+                    let u = st.usage.lock().unwrap();
+                    u.get(&p.id).map(|s| s.backoff_until).unwrap_or(0)
+                };
+                if bu > now {
+                    earliest_retry = Some(earliest_retry.map_or(bu, |e: u64| e.min(bu)));
+                    continue;
                 }
+                let n = consecutive_429.get(&p.id).copied().unwrap_or(0);
+                let n = poll_profile(&app, p, n);
+                consecutive_429.insert(p.id.clone(), n);
             }
-            // 60 s while a session is active, 300 s otherwise (upstream throttling discipline)
+            // 60 s while a session is active, 300 s otherwise (upstream throttling discipline); sooner if a back-off ends first
             let active = {
                 let st = app.state::<AppState>();
                 let store = st.store.lock().unwrap();
                 let s = store.snapshot("en", "en", false);
                 !s.sessions.is_empty()
             };
-            sleep_interruptible(if active {
-                POLL_ACTIVE_SECS
-            } else {
-                POLL_IDLE_SECS
-            });
+            let mut wait = if active { POLL_ACTIVE_SECS } else { POLL_IDLE_SECS };
+            if let Some(bu) = earliest_retry {
+                wait = wait.min(((bu.saturating_sub(now_ms())) / 1000).clamp(1, 30));
+            }
+            sleep_interruptible(wait);
         }
     });
 }

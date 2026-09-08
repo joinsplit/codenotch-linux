@@ -72,6 +72,11 @@ fn parse(url: &str, body: &str) -> HookEvent {
         tool_name: s("tool_name"),
         tool_cmd,
         model: s("model"),
+        // Claude Code puts transcript_path in every hook payload; its .claude-<slug> component names the profile
+        profile: {
+            let tp = s("transcript_path");
+            if tp.is_empty() { String::new() } else { crate::profiles::id_for_path(std::path::Path::new(&tp)) }
+        },
         src: "hook",
     }
 }

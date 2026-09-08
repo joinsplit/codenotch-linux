@@ -17,6 +17,7 @@ mod glyphs;
 mod activity;
 mod diag;
 mod watcher;
+mod profiles;
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -32,7 +33,10 @@ pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three windo
 pub struct AppState {
     pub store: Mutex<state::Store>,
     pub cfg: Mutex<config::Config>,
-    pub usage: Mutex<usage::UsageSnapshot>,
+    /// Claude profiles in display order (~/.claude first, then ~/.claude-<slug> alphabetically), re-discovered by the usage poller
+    pub profiles: Mutex<Vec<profiles::Profile>>,
+    /// One Claude reading per profile id
+    pub usage: Mutex<std::collections::HashMap<String, usage::UsageSnapshot>>,
     /// Codex snapshot (same UsageSnapshot shape; status may also be none/absent)
     pub codex: Mutex<usage::UsageSnapshot>,
     pub cursor: Mutex<usage::UsageSnapshot>,
@@ -290,16 +294,18 @@ fn get_state(state: tauri::State<AppState>) -> state::Snapshot {
 }
 
 #[tauri::command]
-fn get_usage(state: tauri::State<AppState>) -> usage::UsageSnapshot {
-    state.usage.lock().unwrap().clone()
+fn get_usage(app: AppHandle) -> Vec<usage::ProfileUsage> {
+    usage::profile_usages(&app)
 }
 
 #[tauri::command]
 fn refresh_usage(app: AppHandle) {
     {
         let st = app.state::<AppState>();
-        let mut u = st.usage.lock().unwrap();
-        u.backoff_until = 0;
+        let mut all = st.usage.lock().unwrap();
+        for u in all.values_mut() {
+            u.backoff_until = 0;
+        }
     }
     usage::request_refresh();
     codex::request_refresh();
@@ -626,6 +632,7 @@ fn main() {
 
     let cfg = config::load();
     let port = cfg.port;
+    let claude_profiles = profiles::discover();
     // First run: the placement line goes into run.log before anything else creates the data folder
     if let Some(dir) = config::config_path().parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -641,7 +648,8 @@ fn main() {
         .manage(AppState {
             store: Mutex::new(Default::default()),
             cfg: Mutex::new(cfg),
-            usage: Mutex::new(usage::load_persisted()),
+            usage: Mutex::new(usage::load_persisted(&claude_profiles)),
+            profiles: Mutex::new(claude_profiles),
             codex: Mutex::new(codex::load_persisted()),
             cursor: Mutex::new(cursor::load_persisted()),
             antigravity: Mutex::new(antigravity::load_persisted()),
