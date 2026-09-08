@@ -19,10 +19,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
-const POLL_ACTIVE_SECS: u64 = 60;
-const POLL_IDLE_SECS: u64 = 300;
-const BACKOFF_BASE_SECS: u64 = 60;
-const BACKOFF_CAP_SECS: u64 = 900;
+// The usage endpoint rate-limits per account, and every profile is its own account, but the
+// requests all leave one machine: 2 min while a session is active, 10 min idle, profiles polled
+// a few seconds apart rather than as a burst, and a reading younger than the active interval is
+// not refetched after a restart. Back-off on 429: 2 min × 2^n, capped at 30 min, persisted.
+const POLL_ACTIVE_SECS: u64 = 120;
+const POLL_IDLE_SECS: u64 = 600;
+const STAGGER_SECS: u64 = 5;
+const BACKOFF_BASE_SECS: u64 = 120;
+const BACKOFF_CAP_SECS: u64 = 1800;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -403,20 +408,32 @@ pub fn start(app: AppHandle) {
             let profiles = refresh_profiles(&app);
             let now = now_ms();
             let mut earliest_retry: Option<u64> = None;
+            let mut polled = 0;
             for p in &profiles {
                 // No requests inside a profile's backoff window
-                let bu = {
+                let (bu, fresh) = {
                     let st = app.state::<AppState>();
                     let u = st.usage.lock().unwrap();
-                    u.get(&p.id).map(|s| s.backoff_until).unwrap_or(0)
+                    let s = u.get(&p.id);
+                    (
+                        s.map(|s| s.backoff_until).unwrap_or(0),
+                        s.map(|s| s.status == "ok" && now.saturating_sub(s.fetched_at) < POLL_ACTIVE_SECS * 1000).unwrap_or(false),
+                    )
                 };
                 if bu > now {
                     earliest_retry = Some(earliest_retry.map_or(bu, |e: u64| e.min(bu)));
                     continue;
                 }
+                if fresh {
+                    continue; // a restart right after a reading is not a reason to ask again
+                }
+                if polled > 0 {
+                    std::thread::sleep(Duration::from_secs(STAGGER_SECS));
+                }
                 let n = consecutive_429.get(&p.id).copied().unwrap_or(0);
                 let n = poll_profile(&app, p, n);
                 consecutive_429.insert(p.id.clone(), n);
+                polled += 1;
             }
             // 60 s while a session is active, 300 s otherwise (upstream throttling discipline); sooner if a back-off ends first
             let active = {
