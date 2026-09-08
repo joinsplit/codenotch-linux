@@ -17,6 +17,8 @@ mod glyphs;
 mod activity;
 mod diag;
 mod watcher;
+#[cfg(target_os = "linux")]
+mod linux;
 
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -76,10 +78,13 @@ pub fn place_notch(app: &AppHandle) {
         let _ = w.set_size(target);
         // Position from the window's measured physical size — deriving it from the scale factor
         // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
+        // GTK reports 0×0 for a window that has not been shown yet; the target size is the truth then
         let (ww, wh) = w
             .outer_size()
+            .ok()
+            .filter(|s| s.width > 0 && s.height > 0)
             .map(|s| (s.width as i32, s.height as i32))
-            .unwrap_or(((NOTCH_W * scale) as i32, (NOTCH_H * scale) as i32));
+            .unwrap_or((target.width as i32, target.height as i32));
         let x = mon.position().x + mon.size().width as i32 - ww;
         // Vertical position comes from the configured ratio (the pill can be dragged; it persists), clamped to the monitor
         let ratio = {
@@ -134,7 +139,11 @@ fn left_button_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn left_button_down() -> bool {
+    linux::left_button_down()
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 fn left_button_down() -> bool {
     false
 }
@@ -232,8 +241,44 @@ fn noactivate(app: &AppHandle) {
         }
     }
 }
-#[cfg(not(windows))]
+/// GTK: no focus on map or click, no taskbar / pager entry, kept above, and the DOCK type hint so the
+/// window manager keeps it on every workspace and above normal windows without ever giving it focus.
+/// Hints are read when the window is mapped, and the notch is created hidden, so this runs before show().
+#[cfg(target_os = "linux")]
+fn noactivate(app: &AppHandle) {
+    use gtk::prelude::*;
+    if let Some(w) = app.get_webview_window("notch") {
+        if let Ok(gw) = w.gtk_window() {
+            gw.set_accept_focus(false);
+            gw.set_focus_on_map(false);
+            gw.set_skip_taskbar_hint(true);
+            gw.set_skip_pager_hint(true);
+            gw.set_keep_above(true);
+            gw.set_type_hint(gtk::gdk::WindowTypeHint::Dock);
+            gw.stick();
+        }
+    }
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 fn noactivate(_app: &AppHandle) {}
+
+/// Opens a URL or a folder with the platform's default handler
+pub fn open_external(target: &str) {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", target]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let _ = cmd.spawn();
+    }
+    #[cfg(target_os = "linux")]
+    linux::open_external(target);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = std::process::Command::new("open").arg(target).spawn();
+    }
+}
 
 // ---------------- commands ----------------
 
@@ -289,14 +334,7 @@ pub fn reload_glyphs(app: &AppHandle) {
 fn open_data_dir() {
     let dir = config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let _ = std::fs::create_dir_all(glyphs::user_dir());
-    let mut cmd = std::process::Command::new("explorer");
-    cmd.arg(dir.as_os_str());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    open_external(&dir.to_string_lossy());
 }
 
 #[tauri::command]
@@ -318,14 +356,7 @@ fn open_provider_page(provider: String) {
         "gemini" => "https://antigravity.google",
         _ => "https://claude.ai/settings/usage",
     };
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    open_external(url);
 }
 
 /// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's
@@ -457,14 +488,7 @@ fn log_js(msg: String) {
 
 #[tauri::command]
 fn open_usage_page() {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", "https://claude.ai/settings/usage"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let _ = cmd.spawn();
+    open_external("https://claude.ai/settings/usage");
 }
 
 #[tauri::command]
@@ -496,7 +520,7 @@ fn set_lang(app: AppHandle, lang: String) {
 }
 
 /// Seen-clears-it: looking at a session acknowledges it (engine behaviour, unchanged)
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn ack_scan(app: &AppHandle) -> bool {
     let need = {
         let st = app.state::<AppState>();
@@ -523,7 +547,7 @@ fn ack_scan(app: &AppHandle) -> bool {
         }
     })
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn ack_scan(_app: &AppHandle) -> bool {
     false
 }
@@ -550,8 +574,25 @@ fn report(r: Result<String, String>) {
     let _ = std::fs::write(log, &msg);
 }
 
+/// On a Wayland session the notch runs on XWayland: Wayland lets no client place its own window at a
+/// screen edge and GNOME ignores keep-above, so a native Wayland notch would be an ordinary floating
+/// window that anything can cover. The X11 backend restores edge placement, keep-above and no-focus.
+/// Set CODENOTCH_NATIVE_WAYLAND=1 to opt out. Must run before GTK initialises, i.e. before the Tauri builder.
+#[cfg(target_os = "linux")]
+fn prefer_x11_backend() {
+    if std::env::var_os("GDK_BACKEND").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("CODENOTCH_NATIVE_WAYLAND").is_none()
+    {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn prefer_x11_backend() {}
+
 fn main() {
     attach_console();
+    prefer_x11_backend();
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
@@ -567,7 +608,7 @@ fn main() {
                 let r = match args.get(2).map(|s| s.as_str()) {
                     Some("on") => autostart::enable(),
                     Some("off") => autostart::disable(),
-                    _ => Err("usage: codenotch.exe autostart on|off".into()),
+                    _ => Err("usage: codenotch autostart on|off".into()),
                 };
                 report(r);
                 return;
@@ -585,6 +626,10 @@ fn main() {
 
     let cfg = config::load();
     let port = cfg.port;
+    // First run: the placement line goes into run.log before anything else creates the data folder
+    if let Some(dir) = config::config_path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -630,6 +675,8 @@ fn main() {
             if let Some(w) = handle.get_webview_window("notch") {
                 let _ = w.show();
             }
+            // GTK re-reads the input hint on map, so the no-focus flags are applied once more now that the window is up
+            noactivate(&handle);
             tray::setup(&handle)?;
             server::start(handle.clone(), port);
             watcher::start(handle.clone());

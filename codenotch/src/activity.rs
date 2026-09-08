@@ -456,7 +456,42 @@ fn claude_io_bytes() -> Option<(u64, u64)> {
         Some((other, read))
     }
 }
-#[cfg(not(windows))]
+/// Linux: the desktop app is Electron here too, so the network service child is the process whose
+/// command line carries `network.mojom.NetworkService`; its /proc io counters (wchar, rchar) stand in
+/// for the Win32 Other/Read transfer counts. Same cache discipline as the Windows lookup.
+#[cfg(target_os = "linux")]
+fn claude_net_pid(maps: &crate::focus::ProcMaps) -> Option<u32> {
+    let now = now_ms();
+    {
+        let g = CLAUDE_NET_PID.lock().unwrap();
+        let (pid, at) = *g;
+        if pid != 0 && maps.name.contains_key(&pid) && now.saturating_sub(at) < 5 * 60_000 {
+            return Some(pid);
+        }
+        if pid == 0 && at != 0 && now.saturating_sub(at) < 60_000 {
+            return None;
+        }
+    }
+    let found = maps
+        .name
+        .iter()
+        .filter(|(_, n)| n.contains("claude") && !n.contains("codenotch"))
+        .map(|(pid, _)| *pid)
+        .find(|pid| crate::linux::cmdline(*pid).contains("network.mojom.NetworkService"));
+    *CLAUDE_NET_PID.lock().unwrap() = (found.unwrap_or(0), now);
+    if let Some(p) = found {
+        crate::applog(&format!("claude net pid = {p}"));
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn claude_io_bytes() -> Option<(u64, u64)> {
+    let maps = crate::focus::proc_maps();
+    let pid = claude_net_pid(&maps)?;
+    crate::linux::io_counters(pid)
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 fn claude_io_bytes() -> Option<(u64, u64)> {
     None
 }
@@ -584,7 +619,14 @@ pub fn lower_thread_priority() {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn lower_thread_priority() {
+    // On Linux setpriority(PRIO_PROCESS, 0) applies to the calling thread only, which is exactly what is wanted
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS as _, 0, 5);
+    }
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn lower_thread_priority() {}
 
 pub fn start(app: AppHandle) {

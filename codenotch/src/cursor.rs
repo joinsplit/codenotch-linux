@@ -126,7 +126,7 @@ fn read_credentials() -> Option<Creds> {
 
 /// For doctor: contains no secret values
 pub fn probe() -> String {
-    let Some(p) = store_url() else { return "Cursor: cannot locate %APPDATA%".into() };
+    let Some(p) = store_url() else { return "Cursor: cannot locate the user config directory".into() };
     if !p.is_file() {
         return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
     }

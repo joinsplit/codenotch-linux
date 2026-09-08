@@ -19,6 +19,24 @@ pub fn resolve_auto() -> &'static str {
             }
         }
     }
+    #[cfg(not(windows))]
+    {
+        // POSIX locale precedence: LC_ALL, then LC_MESSAGES, then LANG (e.g. "ja_JP.UTF-8")
+        for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Some(v) = std::env::var_os(var) {
+                let name = v.to_string_lossy().to_lowercase();
+                if name.is_empty() || name == "c" || name == "posix" {
+                    continue;
+                }
+                for (prefix, lang) in [("zh", "zh"), ("ja", "ja"), ("ko", "ko")] {
+                    if name.starts_with(prefix) {
+                        return lang;
+                    }
+                }
+                break;
+            }
+        }
+    }
     "en"
 }
 
@@ -33,8 +51,8 @@ pub fn tr(lang: &str, key: &str) -> &'static str {
         ("zh", "quit") => "退出",
         ("zh", "hooks_missing") => "钩子未安装：右键托盘图标 → 安装 Claude Code 钩子（桌面版无需，已自动兜底）",
         ("zh", "autostart") => "开机自启（静默待命）",
-        ("ja", "autostart") => "Windows起動時に自動開始",
-        ("ko", "autostart") => "Windows 시작 시 자동 실행",
+        ("ja", "autostart") => "サインイン時に自動開始",
+        ("ko", "autostart") => "로그인 시 자동 실행",
         ("zh", "refresh") => "立即刷新用量",
         ("zh", "open_data") => "打开数据文件夹（日志 / 图标）",
         ("ja", "open_data") => "データフォルダを開く（ログ / アイコン）",
@@ -63,7 +81,7 @@ pub fn tr(lang: &str, key: &str) -> &'static str {
         (_, "reset_pos") => "Reset bar position",
         (_, "quit") => "Quit",
         (_, "hooks_missing") => "Hooks not installed: tray right-click → Install Claude Code hooks (desktop app auto-fallback active)",
-        (_, "autostart") => "Start with Windows (silent)",
+        (_, "autostart") => "Start at sign-in (silent)",
         (_, "refresh") => "Refresh usage now",
         _ => "?",
     }

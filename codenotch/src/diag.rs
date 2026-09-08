@@ -206,5 +206,14 @@ pub fn run() -> String {
             }
         }
     }
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = std::process::Command::new("ps").args(["-eo", "pid,comm,args"]).output() {
+            for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.to_lowercase().contains("codex")) {
+                let l: String = l.chars().take(160).collect();
+                o += &format!("  {l}\n");
+            }
+        }
+    }
     o
 }

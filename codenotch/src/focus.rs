@@ -114,7 +114,7 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
     true
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn focus_terminal(_claude_pid: u32) -> bool {
     false
 }
@@ -268,7 +268,50 @@ pub fn focus_claude_desktop() -> bool {
     true
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn focus_claude_desktop() -> bool {
     false
+}
+
+// ---------------- Linux: the same API over /proc and X11 (see linux.rs) ----------------
+
+#[cfg(target_os = "linux")]
+pub use crate::linux::{proc_maps, fg_pid, ProcMaps};
+
+#[cfg(target_os = "linux")]
+pub fn chain_of(pid: u32, ppid: &std::collections::HashMap<u32, u32>) -> Vec<u32> {
+    let mut chain = vec![pid];
+    let mut cur = pid;
+    for _ in 0..8 {
+        match ppid.get(&cur) {
+            Some(&p) if p > 1 && !chain.contains(&p) => {
+                chain.push(p);
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Whether the foreground process belongs to a session's terminal window (itself on the chain, or its parent)
+#[cfg(target_os = "linux")]
+pub fn pid_hits_chain(pid: u32, chain: &[u32], maps: &ProcMaps) -> bool {
+    chain.contains(&pid) || maps.ppid.get(&pid).map(|p| chain.contains(p)).unwrap_or(false)
+}
+
+/// Jump back to the terminal hosting a CLI session: the first window owned by a process on the
+/// session's parent chain (bash → the terminal emulator → …), largest first. Wayland-native terminals
+/// own no X window, so this returns false for them and the page reports it.
+#[cfg(target_os = "linux")]
+pub fn focus_terminal(claude_pid: u32) -> bool {
+    let maps = proc_maps();
+    let chain = chain_of(claude_pid, &maps.ppid);
+    crate::linux::focus_pids(&chain)
+}
+
+/// Focus the Claude desktop app's main window (largest window whose process name contains claude)
+#[cfg(target_os = "linux")]
+pub fn focus_claude_desktop() -> bool {
+    crate::linux::focus_named(|n| n.contains("claude") && !n.contains("codenotch"))
 }

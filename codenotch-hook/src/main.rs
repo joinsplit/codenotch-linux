@@ -33,12 +33,22 @@ fn main() {
     // Give up quietly — never affect Claude Code
 }
 
-/// Pulls "port": N out of %APPDATA%\codenotch\config.json (hand-rolled scan, no dependency)
+/// Pulls "port": N out of the app's config.json (hand-rolled scan, no dependency):
+/// %APPDATA%\codenotch on Windows, $XDG_CONFIG_HOME/codenotch (default ~/.config/codenotch) elsewhere
+fn config_path() -> Option<String> {
+    if cfg!(windows) {
+        return std::env::var("APPDATA").ok().map(|a| format!("{a}\\codenotch\\config.json"));
+    }
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return Some(format!("{x}/codenotch/config.json"));
+        }
+    }
+    std::env::var("HOME").ok().map(|h| format!("{h}/.config/codenotch/config.json"))
+}
+
 fn read_port() -> u16 {
-    let path = match std::env::var("APPDATA") {
-        Ok(a) => format!("{a}\\codenotch\\config.json"),
-        Err(_) => return DEFAULT_PORT,
-    };
+    let Some(path) = config_path() else { return DEFAULT_PORT };
     let Ok(txt) = std::fs::read_to_string(path) else {
         return DEFAULT_PORT;
     };
@@ -77,7 +87,7 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
 fn spawn_main() {
     let Ok(me) = std::env::current_exe() else { return };
     let Some(dir) = me.parent() else { return };
-    let exe = dir.join("codenotch.exe");
+    let exe = dir.join(format!("codenotch{}", std::env::consts::EXE_SUFFIX));
     if !exe.exists() {
         return;
     }
@@ -91,6 +101,12 @@ fn spawn_main() {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        // Own process group: the app must outlive the hook and whatever Claude Code does to the hook's group on a timeout
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     let _ = cmd.spawn();
 }

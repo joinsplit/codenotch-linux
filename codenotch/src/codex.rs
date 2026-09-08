@@ -98,11 +98,13 @@ pub fn find_executable() -> Option<PathBuf> {
             }
         }
         if let Ok(rd) = std::fs::read_dir(pkg.join("vendor")) {
-            // Newer packages keep the native exe at vendor/<triple>/codex/codex.exe
+            // Newer packages keep the native exe at vendor/<triple>/codex/codex(.exe)
             for e in rd.flatten() {
-                let p = e.path().join("codex").join("codex.exe");
-                if p.exists() {
-                    cands.push(p);
+                for name in ["codex.exe", "codex"] {
+                    let p = e.path().join("codex").join(name);
+                    if p.is_file() {
+                        cands.push(p);
+                    }
                 }
             }
         }
@@ -116,6 +118,7 @@ pub fn find_executable() -> Option<PathBuf> {
         for dir in std::env::split_paths(&path) {
             cands.push(dir.join("codex.exe"));
             cands.push(dir.join("codex.cmd"));
+            cands.push(dir.join("codex"));
         }
     }
     cands.into_iter().find(|p| p.is_file())
@@ -183,7 +186,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
         .set("ChatGPT-Account-Id", &cred.account_id)
         .set("Accept", "application/json")
         .set("Cache-Control", "no-cache, no-store")
-        .set("User-Agent", concat!("codenotch/", env!("CARGO_PKG_VERSION"), " (Windows)"))
+        .set("User-Agent", &format!("codenotch/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS))
         .timeout(Duration::from_secs(15))
         .call();
     match resp {

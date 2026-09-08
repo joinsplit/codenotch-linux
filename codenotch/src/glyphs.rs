@@ -249,6 +249,7 @@ fn from_exe(_p: &Path) -> Option<Glyph> {
     None
 }
 
+#[cfg(windows)]
 fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     {
