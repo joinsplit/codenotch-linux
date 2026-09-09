@@ -115,7 +115,7 @@ const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
 
 /* Colour ramp (upstream palette values) */
-const AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
+const AMPLE='#00FF88', WATCH='#FF9500', CRIT='#FF3F00'; // watch band is orange (the upstream yellow read too close to white on the pill)
 const TRACK='#303030', AMBER='#FFBF00', RUNGREEN='#28E07B';
 const tone=f=> f>=0.8?CRIT : f>=0.5?WATCH : AMPLE;
 
