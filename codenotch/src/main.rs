@@ -645,6 +645,19 @@ fn main() {
             applog(&format!("single instance: another launch was refused; the running instance is build={BUILD} — quit it from the tray first if you just rebuilt"));
             let _ = app.emit("notice", format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
         }))
+        // The notch only ever shows its own page. Without this, a link dropped anywhere on the
+        // transparent window loads that site in place of the pill (seen with a YouTube link).
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
+                .on_navigation(|_, url: &tauri::Url| {
+                    let own = url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost");
+                    if !own {
+                        applog(&format!("navigation blocked: {url}"));
+                    }
+                    own
+                })
+                .build(),
+        )
         .manage(AppState {
             store: Mutex::new(Default::default()),
             cfg: Mutex::new(cfg),
