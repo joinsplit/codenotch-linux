@@ -28,6 +28,16 @@ pub fn open_external(target: &str) {
     let _ = cmd.spawn();
 }
 
+/// Desktop notification through notify-send (libnotify); quietly nothing if it is not installed
+pub fn notify(msg: &str) {
+    let mut cmd = std::process::Command::new("notify-send");
+    cmd.args(["--app-name=Codenotch", "Codenotch", msg])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
+}
+
 // ---------------- /proc ----------------
 
 pub struct ProcMaps {

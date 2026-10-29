@@ -12,13 +12,13 @@
       {
         "label": "notch",
         "url": "notch.html",
-        "width": 340,
-        "height": 460,
+        "width": 70,
+        "height": 170,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "resizable": false,
+        "resizable": true,
         "shadow": false,
         "visible": false,
         "focus": false

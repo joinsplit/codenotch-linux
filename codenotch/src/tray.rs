@@ -2,7 +2,7 @@ use crate::hooks_install;
 use crate::i18n::tr;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri::{AppHandle, Manager, Wry};
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let lang = {
@@ -78,8 +78,8 @@ fn refresh_menu(app: &AppHandle) {
 
 fn handle(app: &AppHandle, id: &str) {
     match id {
-        "install" => notice(app, hooks_install::install()),
-        "uninstall" => notice(app, hooks_install::uninstall()),
+        "install" => notice(hooks_install::install()),
+        "uninstall" => notice(hooks_install::uninstall()),
         "reset" => crate::reset_bar(app),
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -107,7 +107,7 @@ fn handle(app: &AppHandle, id: &str) {
             } else {
                 crate::autostart::enable()
             };
-            notice(app, r);
+            notice(r);
             refresh_menu(app); // refresh the check marks
         }
         "quit" => app.exit(0),
@@ -116,10 +116,10 @@ fn handle(app: &AppHandle, id: &str) {
     }
 }
 
-fn notice(app: &AppHandle, r: Result<String, String>) {
+fn notice(r: Result<String, String>) {
     let msg = match r {
         Ok(m) => m,
         Err(e) => format!("Error: {e}"),
     };
-    let _ = app.emit("notice", &msg);
+    crate::notify(&msg);
 }

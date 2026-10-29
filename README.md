@@ -22,6 +22,10 @@ GNOME, Wayland session (see [Wayland](#wayland) below).
 
 Providers that are not installed simply do not get a cell.
 
+The notch is only the pill: there is no hover card, and the window is sized to the pill itself, so it
+never covers anything beside it. Click a ring to open that provider's usage page; drag the pill to
+move it along the edge.
+
 ### Claude profiles (work and personal)
 
 Claude Code keeps everything for one account under a single directory: `~/.claude` by default, or
@@ -29,7 +33,7 @@ wherever `CLAUDE_CONFIG_DIR` points. If you keep a second login apart as `~/.cla
 (or `~/.claude-client`, and so on), each such directory is a **profile** and gets its own ring:
 `~/.claude` first, then every used `~/.claude-<slug>` in alphabetical order, with the slug shown as
 a small tag under the ring. Each ring polls its own credential, watches its own `projects` folder
-and spins only for its own sessions; the card names the directory and lists that profile's sessions.
+and spins only for its own sessions.
 `install-hooks` wires the hook into every profile's `settings.json`. A profile that Claude Code has
 never run against (no credential, settings or projects yet) is ignored, so a stray directory never
 shows a permanent "sign in" ring. New profiles are picked up on the next usage poll; no restart needed.
@@ -66,11 +70,9 @@ requests, so a native Wayland notch would be an ordinary floating window. On a W
 app therefore starts itself on XWayland (`GDK_BACKEND=x11`), where edge placement, keep-above,
 no-focus and sticky-on-every-workspace all work. Set `CODENOTCH_NATIVE_WAYLAND=1` to opt out.
 
-Two features see X11 windows only, and so quietly do nothing for Wayland-native terminals under a
-Wayland session (they work fully on an Xorg session):
-
-- **Seen-clears-it** — looking at the terminal of a finished session acknowledges it.
-- **Jump back** — clicking a session in the card raises its terminal.
+**Seen-clears-it** (looking at the terminal of a finished session acknowledges it) sees X11 windows
+only, and so quietly does nothing for Wayland-native terminals under a Wayland session (it works
+fully on an Xorg session).
 
 ### Icons
 
@@ -86,7 +88,7 @@ The marks remain the trademarks of their owners.
 ├── codenotch/          Tauri 2 app: window, tray, providers (usage.rs, codex.rs, cursor.rs, antigravity.rs),
 │   ├── src/            session engine (watcher.rs, state.rs, focus.rs), glyphs.rs, doctor.rs,
 │   │                   linux.rs (X11 + /proc + xdg-open back-ends)
-│   ├── ui/notch.html   the pill + hover card (single file, no framework)
+│   ├── ui/notch.html   the pill (single file, no framework)
 │   └── glyphs/         provider marks (+ NOTICE.md)
 ├── codenotch-hook/     <5 ms hook messenger Claude Code calls; forwards events to the app
 └── install.sh          user-level install: ~/.local/bin + a .desktop launcher

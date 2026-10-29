@@ -24,11 +24,13 @@ mod linux;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card on the left.
-pub const NOTCH_W: f64 = 340.0;
+/// Logical width of the notch window: exactly the 70 pt pill column, so no transparent area is left to swallow clicks.
+pub const NOTCH_W: f64 = 70.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r31";
-pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three window blocks plus the session list
+pub const BUILD: &str = "r32";
+/// Logical height until the page reports the pill's real height (it grows with the number of cells, see fit_notch)
+pub const NOTCH_H: f64 = 170.0;
+static NOTCH_HEIGHT: Mutex<f64> = Mutex::new(NOTCH_H);
 
 pub struct AppState {
     pub store: Mutex<state::Store>,
@@ -66,29 +68,40 @@ pub fn broadcast(app: &AppHandle) {
 }
 
 /// Pins the notch to the right edge of the primary monitor; the other edges are a later milestone.
+/// The placement line starts a fresh run.log: the first thing to check when the notch is not visible.
 pub fn place_notch(app: &AppHandle) {
-    let Some(w) = app.get_webview_window("notch") else {
-        return;
-    };
+    if let Some(line) = position_notch(app) {
+        let log = config::config_path().with_file_name("run.log");
+        let _ = std::fs::write(log, format!("{line}\n"));
+    }
+}
+
+/// Sizes the window to the pill and places it at the configured height; returns the placement line
+fn position_notch(app: &AppHandle) -> Option<String> {
+    let w = app.get_webview_window("notch")?;
     let scale = w.scale_factor().unwrap_or(1.0);
+    let notch_h = *NOTCH_HEIGHT.lock().unwrap();
     if let Ok(Some(mon)) = w.primary_monitor() {
         // Two monitors at different scales (150 % and 200 % in practice): the physical size can
         // end up converted with the *other* monitor's scale factor depending on where the window
-        // is created and then moved, leaving the WebView ~256 logical px wide instead of 340.
+        // is created and then moved, leaving the WebView narrower than designed (~256 px instead of 340 then).
         // So the physical size is pinned straight from mon.scale_factor() before placing the
         // window; if it still reports a different scale afterwards, it is pinned once more.
         let ms = mon.scale_factor();
-        let target = tauri::PhysicalSize::new((NOTCH_W * ms).round() as u32, (NOTCH_H * ms).round() as u32);
+        let target = tauri::PhysicalSize::new((NOTCH_W * ms).round() as u32, (notch_h * ms).round() as u32);
         let _ = w.set_size(target);
-        // Position from the window's measured physical size — deriving it from the scale factor
+        // Position from the window's measured physical width — deriving it from the scale factor
         // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
-        // GTK reports 0×0 for a window that has not been shown yet; the target size is the truth then
-        let (ww, wh) = w
+        // GTK reports 0×0 for a window that has not been shown yet; the target size is the truth then.
+        // The height is the target's: GTK resizes asynchronously, so after fit_notch the measured
+        // height is still the old one and the pill would be centred off by half the difference.
+        let ww = w
             .outer_size()
             .ok()
             .filter(|s| s.width > 0 && s.height > 0)
-            .map(|s| (s.width as i32, s.height as i32))
-            .unwrap_or((target.width as i32, target.height as i32));
+            .map(|s| s.width as i32)
+            .unwrap_or(target.width as i32);
+        let wh = target.height as i32;
         let x = mon.position().x + mon.size().width as i32 - ww;
         // Vertical position comes from the configured ratio (the pill can be dragged; it persists), clamped to the monitor
         let ratio = {
@@ -105,19 +118,34 @@ pub fn place_notch(app: &AppHandle) {
             let x = mon.position().x + mon.size().width as i32 - target.width as i32;
             let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
         }
-        // Placement log line: the first thing to check when the notch is not visible
-        let log = config::config_path().with_file_name("run.log");
-        let _ = std::fs::write(
-            log,
-            format!(
-                "notch placed build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})\n",
-                w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
-                mon.position().x,
-                mon.position().y,
-                mon.size().width,
-                mon.size().height
-            ),
-        );
+        return Some(format!(
+            "notch placed build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})",
+            w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
+            mon.position().x,
+            mon.position().y,
+            mon.size().width,
+            mon.size().height
+        ));
+    }
+    None
+}
+
+/// The page reports the pill's height (fillets included, design px) whenever its cells change, and the
+/// window is resized around it. Ignored mid-drag; the page reports again once the drag ends.
+#[tauri::command]
+fn fit_notch(app: AppHandle, h: f64) {
+    if !(40.0..=2000.0).contains(&h) || DRAGGING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    {
+        let mut cur = NOTCH_HEIGHT.lock().unwrap();
+        if (*cur - h).abs() < 0.5 {
+            return;
+        }
+        *cur = h;
+    }
+    if let Some(line) = position_notch(&app) {
+        applog(&line);
     }
 }
 
@@ -365,17 +393,6 @@ fn open_provider_page(provider: String) {
     open_external(url);
 }
 
-/// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's
-/// top-left as x,y,w,h) = expanded; None = collapsed. The page converts the rectangles with its
-/// own devicePixelRatio before reporting them, so no scale conversion happens on this side —
-/// WebView2's DPR and the window's scale_factor can disagree (see report_dpr).
-static HOT: Mutex<Option<Vec<[f64; 4]>>> = Mutex::new(None);
-
-#[tauri::command]
-fn set_expanded(on: bool, rects: Option<Vec<[f64; 4]>>) {
-    *HOT.lock().unwrap() = if on { Some(rects.unwrap_or_default()) } else { None };
-}
-
 /// The WebView zoom currently applied (1.0 = uncorrected)
 static ZOOM: Mutex<f64> = Mutex::new(1.0);
 
@@ -387,11 +404,18 @@ pub fn applog(line: &str) {
     }
 }
 
+/// A short message for the user: the pill has no room for text, so it goes out as a desktop
+/// notification, and into run.log
+pub fn notify(msg: &str) {
+    applog(&format!("notice: {msg}"));
+    #[cfg(target_os = "linux")]
+    linux::notify(msg);
+}
+
 /// Root cause: with two monitors (150 % / 200 %) WebView2 picked a devicePixelRatio of 2.0 while
-/// the window was sized for the primary monitor's 1.5, so the page was 255 CSS px wide instead of
-/// the designed 340 and every coordinate conversion was off (the watchdog misfired and the card
-/// flashed away). Fix: the page reports its DPR, and when it differs from the primary monitor's
-/// scale, set_zoom pulls the effective DPR back to that scale, restoring the 340 px width.
+/// the window was sized for the primary monitor's 1.5, so the page was narrower than designed and
+/// every coordinate conversion was off. Fix: the page reports its DPR, and when it differs from the
+/// primary monitor's scale, set_zoom pulls the effective DPR back to that scale, restoring the design width.
 #[tauri::command]
 fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     let Some(win) = app.get_webview_window("notch") else { return };
@@ -425,68 +449,7 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     }
 }
 
-/// WebView2's mouseleave is unreliable inside a NOACTIVATE transparent window — a cursor that
-/// leaves quickly often produces no WM_MOUSELEAVE, and the card stays up. Rather than trust DOM
-/// events, the Rust side watches the system cursor while the card is expanded and emits
-/// pointer_left once the cursor is outside; the page collapses after its 250 ms grace period.
-/// "Outside the window" is not the test, though: the window has a 340×460 transparent area, so
-/// the cursor is compared against the hot rectangles the page reports (pill, card, and the gap
-/// between them), and two consecutive misses (300 ms) count as leaving.
-fn start_pointer_watchdog(app: AppHandle) {
-    std::thread::spawn(move || {
-        let mut miss = 0u8;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let rects = match HOT.lock().unwrap().clone() {
-                Some(r) => r,
-                None => {
-                    miss = 0;
-                    continue;
-                }
-            };
-            let Some(w) = app.get_webview_window("notch") else { continue };
-            let (Ok(pos), Ok(cur)) = (w.outer_position(), app.cursor_position()) else { continue };
-            // Cursor position relative to the window's top-left, in physical pixels; the hot rectangles are physical too, so no scale conversion
-            let lx = cur.x - pos.x as f64;
-            let ly = cur.y - pos.y as f64;
-            const PAD: f64 = 10.0;
-            let in_window = w
-                .outer_size()
-                .map(|s| lx >= 0.0 && ly >= 0.0 && lx < s.width as f64 && ly < s.height as f64)
-                .unwrap_or(true);
-            let mut inside = in_window && rects.iter().any(|r| {
-                lx >= r[0] - PAD && ly >= r[1] - PAD && lx < r[0] + r[2] + PAD && ly < r[1] + r[3] + PAD
-            });
-            // The gap between hot rectangles (pill and card) counts as inside: use the bounding box of all of them
-            if !inside && in_window && rects.len() > 1 {
-                let x0 = rects.iter().map(|r| r[0]).fold(f64::MAX, f64::min);
-                let y0 = rects.iter().map(|r| r[1]).fold(f64::MAX, f64::min);
-                let x1 = rects.iter().map(|r| r[0] + r[2]).fold(f64::MIN, f64::max);
-                let y1 = rects.iter().map(|r| r[1] + r[3]).fold(f64::MIN, f64::max);
-                inside = lx >= x0 && ly >= y0 && lx < x1 && ly < y1;
-            }
-            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
-                applog(&format!(
-                    "watchdog: cursor_rel=({lx:.0},{ly:.0}) inside={inside} rects={rects:?} winpos=({},{})",
-                    pos.x, pos.y
-                ));
-            }
-            if inside {
-                miss = 0;
-            } else {
-                miss += 1;
-                if miss >= 2 {
-                    miss = 0;
-                    *HOT.lock().unwrap() = None;
-                    let _ = app.emit("pointer_left", ());
-                }
-            }
-        }
-    });
-}
-
-/// Log channel for the page: JS writes key diagnostics into run.log (if invoke itself fails, the page reports on screen instead)
+/// Log channel for the page: JS writes key diagnostics into run.log
 #[tauri::command]
 fn log_js(msg: String) {
     applog(&format!("js: {}", msg.chars().take(600).collect::<String>()));
@@ -639,11 +602,11 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
             // Launching a freshly built exe while the old one is still running lands here: the new
             // instance is turned away and what stays on screen is the old process. Say so loudly.
             applog(&format!("single instance: another launch was refused; the running instance is build={BUILD} — quit it from the tray first if you just rebuilt"));
-            let _ = app.emit("notice", format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
+            notify(&format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
         }))
         // The notch only ever shows its own page. Without this, a link dropped anywhere on the
         // transparent window loads that site in place of the pill (seen with a YouTube link).
@@ -682,7 +645,7 @@ fn main() {
             open_provider_page,
             refresh_usage,
             open_usage_page,
-            set_expanded,
+            fit_notch,
             report_dpr,
             log_js,
             focus_session,
@@ -709,7 +672,6 @@ fn main() {
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
-            start_pointer_watchdog(handle.clone());
             // Seen-clears-it scan
             let acker = handle.clone();
             std::thread::spawn(move || {
